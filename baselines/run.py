@@ -1,4 +1,5 @@
 import sys
+import csv
 import re
 import multiprocessing
 import os.path as osp
@@ -6,6 +7,7 @@ import gym
 from collections import defaultdict
 import tensorflow as tf
 import numpy as np
+import time
 
 from baselines.common.vec_env import VecFrameStack, VecNormalize, VecEnv
 from baselines.common.vec_env.vec_video_recorder import VecVideoRecorder
@@ -227,6 +229,7 @@ def main(args):
         dones = np.zeros((1,))
 
         episode_rew = np.zeros(env.num_envs) if isinstance(env, VecEnv) else np.zeros(1)
+        first_time = True
         while True:
             if state is not None:
                 actions, _, state, _ = model.step(obs,S=state, M=dones)
@@ -235,6 +238,11 @@ def main(args):
 
             obs, rew, done, _ = env.step(actions)
             episode_rew += rew
+            if first_time:
+                print ("starting in 5 sec")
+                time.sleep(5)
+                first_time = False
+
             env.render()
             done_any = done.any() if isinstance(done, np.ndarray) else done
             if done_any:
