@@ -13,6 +13,7 @@ from baselines.common.tf_util import load_variables, save_variables
 from baselines import logger
 from baselines.common.schedules import LinearSchedule
 from baselines.common import set_global_seeds
+from baselines.common.models import mlp
 
 from baselines import deepr
 from baselines.deepr.replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
@@ -103,9 +104,9 @@ def learn(env,
           exploration_fraction=0.1,
           exploration_final_eps=0.1,
           train_freq=1,
-          batch_size=32,
+          batch_size=64,
           print_freq=1,
-          eval_freq=2000,
+          eval_freq=2500,
           checkpoint_freq=10000,
           checkpoint_path=None,
           learning_starts=1000,
@@ -193,7 +194,9 @@ def learn(env,
     sess = get_session()
     set_global_seeds(seed)
 
-    q_func = build_q_func(network, **network_kwargs)
+    #q_func = build_q_func(network, **network_kwargs)
+    q_func = build_q_func(mlp(num_layers=4, num_hidden=64), **network_kwargs)
+    #q_func = build_q_func(mlp(num_layers=2, num_hidden=64, activation=tf.nn.relu), **network_kwargs)
 
     # capture the shape outside the closure so that the env object is not serialized
     # by cloudpickle when serializing make_obs_ph
@@ -269,11 +272,8 @@ def learn(env,
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        phi = np.zeros((2, 2))
-        phi[0, 0] = 0
-        phi[0, 1] = 1
-        phi[1, 0] = 0
-        phi[1, 1] = 1
+        in_threshold_count = 0
+        action_count = 0
 
         for t in range(total_timesteps+1):
             if callback is not None:
@@ -298,51 +298,43 @@ def learn(env,
 
             #print ("--------------------")
             #print ("state: ", env.envs[0].state)
-
-            # Allowed actions mask
-            actions_mask = np.zeros(env.action_space.n)
-            allowed_actions_mask = np.zeros(env.action_space.n)
-            for i in range(env.action_space.n):
-                allowed_actions_mask[i] = 0 if env.envs[0].check_allowed_action(i) else -np.inf
-            allowed_state = env.envs[0].check_allowed_state()
-
-            if config.get('shield_type', 'none') == "hard":
-                action = act(np.array(obs)[None], unused_actions_neginf_mask=allowed_actions_mask, update_eps=update_eps, **kwargs)[0]
-            else:
-                action = act(np.array(obs)[None], unused_actions_neginf_mask=actions_mask, update_eps=update_eps, **kwargs)[0]
-
+            shield_type = config.get('shield_type', 'none')
+            action_mask = env.envs[0].get_mask(shield_type)
+            a = act(np.array(obs)[None], unused_actions_neginf_mask=action_mask, update_eps=update_eps, **kwargs)[0]
+            if shield_type == 'hard':
+                if action_mask[a] != 0:
+                    print ("Chose blocked action!!!!")
+                    exit()
             
             #print ("action: ", action)
             
-            env_action = action
+            env_action = a
             reset = False
             new_obs, rew, done, _ = env.step(env_action)
 
             eval_rewards[-1] += rew
 
-            #print (rew, allowed_actions_mask)
+            x, _, _, _ = new_obs[0]
+            if x >= -2.4 and x <= 2.4:
+                in_threshold_count += 1
+            action_count += a
 
+            action_mask_p = env.envs[0].get_mask(shield_type)
             # Shaping
-            if config.get('shield_type', 'none') == "soft":
-                allowed_action = (allowed_actions_mask[action] == 0)
-
-                f = 0
-                if t > 0:
-                    s_prime = int(allowed_state)
-                    a_prime = int(allowed_action)
-                    s = int(allowed_prev_state)
-                    a = int(allowed_prev_action)
-
-                    f = phi[s_prime, a_prime] - phi[s, a]
-
-                allowed_prev_action = allowed_action
-                allowed_prev_state = allowed_state
-
-                rew += f
+            if shield_type == 'soft':
+                
+                ## look-ahead shaping
+                ap = act(np.array(new_obs)[None], unused_actions_neginf_mask=action_mask_p, stochastic=False)[0]
+                f = action_mask_p[ap] - action_mask[a]
+                rew = rew + f
 
 
             # Store transition in the replay buffer.
-            replay_buffer.add(obs, action, rew, new_obs, float(done))
+            #replay_buffer.add(obs, a, rew, new_obs, float(done), action_mask_p)
+            if shield_type != 'soft':
+                replay_buffer.add(obs, a, rew, new_obs, float(done), np.zeros(env.envs[0].action_space.n))
+            else:
+                replay_buffer.add(obs, a, rew, new_obs, float(done), action_mask_p)
             obs = new_obs
 
             #if done:
@@ -357,9 +349,9 @@ def learn(env,
                     experience = replay_buffer.sample(batch_size, beta=beta_schedule.value(t))
                     (obses_t, actions, rewards, obses_tp1, dones, weights, batch_idxes) = experience
                 else:
-                    obses_t, actions, rewards, obses_tp1, dones = replay_buffer.sample(batch_size)
+                    obses_t, actions, rewards, obses_tp1, dones, masks_tp1 = replay_buffer.sample(batch_size)
                     weights, batch_idxes = np.ones_like(rewards), None
-                td_errors = train(obses_t, actions, rewards, obses_tp1, dones, weights, actions_mask)
+                td_errors = train(obses_t, actions, rewards, obses_tp1, dones, weights, masks_tp1)
                 if prioritized_replay:
                     new_priorities = np.abs(td_errors) + prioritized_replay_eps
                     replay_buffer.update_priorities(batch_idxes, new_priorities)
@@ -381,7 +373,10 @@ def learn(env,
                 writer.writerow({"STEPS": t, "REWARD": np.sum(eval_rewards[-1-print_freq:-1])})
                 csvfile.flush()
 
-                print (env.envs[0].state, action)
+                print (env.envs[0].state, action_mask_p)
+                print (in_threshold_count, action_count)
+                in_threshold_count = 0
+                action_count = 0
 
                 #env.reset()
 

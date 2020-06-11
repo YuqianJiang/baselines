@@ -193,10 +193,19 @@ def build_act(make_obs_ph, q_func, num_actions, scope="deepr", reuse=None):
         random_actions = tf.reshape(tf.random.multinomial(logprobs[tf.newaxis], batch_size), (batch_size,))
 
         ##random_actions = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=num_actions, dtype=tf.int64)
+        '''
+        # EPSILON
         chose_random = tf.random_uniform(tf.stack([batch_size]), minval=0, maxval=1, dtype=tf.float32) < eps
         stochastic_actions = tf.where(chose_random, random_actions, deterministic_actions)
-
         output_actions = tf.cond(stochastic_ph, lambda: stochastic_actions, lambda: deterministic_actions)
+        '''
+        # SOFTMAX
+        temperature = 0.5
+        reshaped_q_values = tf.reshape(q_values, [-1, num_actions])
+        stochastic_actions = tf.random.multinomial((reshaped_q_values + unused_actions_neginf_mask) / temperature, num_samples=1)
+        stochastic_actions = tf.reshape(stochastic_actions, [1])
+        output_actions = tf.cond(stochastic_ph, lambda: stochastic_actions, lambda: deterministic_actions)
+        
         update_eps_expr = eps.assign(tf.cond(update_eps_ph >= 0, lambda: update_eps_ph, lambda: eps))
         _act = U.function(inputs=[observations_ph, unused_actions_neginf_mask, stochastic_ph, update_eps_ph],
                          outputs=output_actions,
@@ -419,10 +428,10 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, avg_reward_learning
             #q_tp1 = tf.boolean_mask(q_tp1, 1-unused_actions_mask, axis=1)
             #q_t_filtered = tf.boolean_mask(q_t, 1-unused_actions_mask, axis=1)
             q_tp1_using_online_net = q_tp1_using_online_net + unused_actions_mask
-            q_t_filtered = q_t + unused_actions_mask
 
             # Best q's -- useful for deciding whether to update R Learning
-            q_t_best = tf.reduce_max(q_t_filtered, 1)
+            # q_t_filtered = q_t + unused_actions_mask
+            # q_t_best = tf.reduce_max(q_t_filtered, 1)
 
             q_tp1_best_using_online_net = tf.argmax(q_tp1_using_online_net, 1)
             ##q_tp1_best_using_online_net = tf.argmax(tf.reshape(q_tp1_using_online_net, [-1, num_actions]), 1)
@@ -430,7 +439,9 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, avg_reward_learning
             ##idx = tf.stack([tf.cast(row_ids, tf.int64), q_tp1_best_using_online_net], axis=1)
             ##q_tp1_best = tf.gather_nd(tf.reshape(q_tp1, [-1, num_actions]), idx)
         else:
-            q_tp1_best = tf.reduce_max(q_tp1, 1)
+            q_tp1_best = tf.argmax(q_tp1 + unused_actions_mask, 1)
+            q_tp1_best = tf.reduce_sum(q_tp1 * tf.one_hot(q_tp1_best, tf.shape(q_tp1)[1]), 1)
+            #q_tp1_best = tf.reduce_max(q_tp1, 1)
         q_tp1_best_masked = (1.0 - done_mask_ph) * q_tp1_best
 
         # compute RHS of bellman equation
@@ -450,15 +461,15 @@ def build_train(make_obs_ph, q_func, num_actions, optimizer, avg_reward_learning
         # R Learning
         tf.summary.scalar('rew_avg', rew_avg)
 
-        use_for_reward = tf.cast(tf.abs(q_t_selected - q_t_best) < 0.10*tf.abs(q_t_best), tf.float32)
+        #use_for_reward = tf.cast(tf.abs(q_t_selected - q_t_best) < 0.10*tf.abs(q_t_best), tf.float32)
         #use_for_reward = tf.cast(tf.abs(q_t_selected - q_t_best) < 1e-6, tf.float32)
-        num_valid_rewards = tf.reduce_sum(use_for_reward)
+        #num_valid_rewards = tf.reduce_sum(use_for_reward)
 
         #with tf.control_dependencies([tf.print(num_valid_rewards)]):
-        rew_avg_next_op = rew_avg_next.assign_add(tf.cond(num_valid_rewards > 0,
-                                                          lambda: avg_reward_learning_rate*(1/num_valid_rewards)*tf.reduce_sum(use_for_reward * td_error),
-                                                          lambda: 0.0))
-        #rew_avg_next_op = rew_avg_next.assign_add(avg_reward_learning_rate*tf.reduce_mean(td_error))
+        #rew_avg_next_op = rew_avg_next.assign_add(tf.cond(num_valid_rewards > 0,
+        #                                                  lambda: avg_reward_learning_rate*(1/num_valid_rewards)*tf.reduce_sum(use_for_reward * td_error),
+        #                                                  lambda: 0.0))
+        rew_avg_next_op = rew_avg_next.assign_add(avg_reward_learning_rate*tf.reduce_mean(td_error))
 
         # compute optimization op (potentially with gradient clipping)
         if grad_norm_clipping is not None:
